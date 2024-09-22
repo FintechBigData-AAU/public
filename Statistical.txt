@@ -1,0 +1,109 @@
+import pandas as pd
+import os
+import numpy as np
+from dash import Dash, dcc, html, Input, Output
+import dash.dash_table
+import base64
+import urllib.parse
+
+# Initialize Dash app
+app = Dash(__name__)
+
+# Define the folder containing CSV files
+folder_path = ""
+
+# Load data
+dfs = []
+for file_name in os.listdir(folder_path):
+    if file_name.endswith('.csv'):
+        file_path = os.path.join(folder_path, file_name)
+        try:
+            df = pd.read_csv(file_path)
+            dfs.append(df)
+        except Exception as e:
+            print(f"Error reading {file_name}: {e}")
+
+# Combine all dataframes into one
+df_combined = pd.concat(dfs, ignore_index=True)
+
+# Fill NaN values
+df_combined['CombinedText'] = df_combined['CombinedText'].fillna('')
+df_combined['Country'] = df_combined['Country'].fillna('[]')
+df_combined['SentimentScore'] = df_combined['SentimentScore'].fillna(0)
+
+# Process the date and create the processed DataFrame
+df_combined['Date'] = pd.to_datetime(df_combined['Date'], errors='coerce')
+df_combined = df_combined[['Date', 'CombinedText', 'Country', 'SentimentScore']]
+
+# Process each row separately
+rows = []
+for _, row in df_combined.iterrows():
+    countries = row['Country']
+    sentiment_score = row['SentimentScore']
+    country_list = countries.strip("[]").replace("'", "").split(", ")
+    for country in country_list:
+        rows.append({'Date': row['Date'], 'Country': country, 'SentimentScore': sentiment_score})
+
+# Create DataFrame from processed rows
+df_processed = pd.DataFrame(rows)
+
+# Group data by date and calculate metrics
+country_trends = df_processed.groupby(['Date', 'Country']).agg(
+    AvgSentiment=('SentimentScore', 'mean'),
+    MentionCount=('SentimentScore', 'size')
+).reset_index()
+
+country_trends['CombinedMetric'] = country_trends['AvgSentiment'] * np.log1p(country_trends['MentionCount'])
+country_trends['CombinedMetric'] = country_trends.groupby('Country')['CombinedMetric'].transform(lambda x: x.rolling(window=7, min_periods=1).mean())
+
+# Calculate statistics
+stats_data = country_trends.groupby('Country')['CombinedMetric'].agg([
+    'mean', 'max', 'min', 'median', 'std', 'var', 
+    lambda x: np.percentile(x, 25), 
+    lambda x: np.percentile(x, 75), 
+    'size'
+]).reset_index()
+
+# Rename columns
+stats_data.columns = [
+    'Country', 'Mean', 'Max', 'Min', 'Median', 'StdDev', 'Variance', '25th Percentile (Q1)', '75th Percentile (Q3)', 'Count'
+]
+
+stats_data = stats_data.sort_values(by='Mean', ascending=False)
+
+# Convert DataFrame to CSV string
+csv_string = stats_data.to_csv(index=False)
+b64 = base64.b64encode(csv_string.encode()).decode()  # Encode to base64
+href = f'data:text/csv;base64,{b64}'
+
+# Layout of the app
+app.layout = html.Div([
+    html.H1("Statistical Analysis Dashboard"),
+    dcc.Dropdown(id='country-dropdown', options=[{'label': country, 'value': country} for country in stats_data['Country'].unique()], value=stats_data['Country'].iloc[0]),
+    html.Div(id='country-stats'),
+    html.Div(dash.dash_table.DataTable(
+        id='full-stats-table',
+        columns=[{'name': col, 'id': col} for col in stats_data.columns],
+        data=stats_data.to_dict('records'),
+        page_size=10,
+    )),
+    html.A("Download Full Statistics as CSV", id='download-link', download='country_extended_statistics_summary.csv', href=href, target='_blank'),
+    html.Footer("Instructions: Save this code as a `.py` file and run it using the command `python filename.py`. This will launch the app.")
+])
+
+@app.callback(
+    Output('country-stats', 'children'),
+    Input('country-dropdown', 'value')
+)
+def update_stats(selected_country):
+    filtered_stats = stats_data[stats_data['Country'] == selected_country]
+    return html.Div([
+        html.H2(f"Statistics for {selected_country}"),
+        dash.dash_table.DataTable(
+            columns=[{'name': col, 'id': col} for col in filtered_stats.columns],
+            data=filtered_stats.to_dict('records'),
+        )
+    ])
+
+if __name__ == '__main__':
+    app.run_server(debug=True)
